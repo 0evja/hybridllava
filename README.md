@@ -1,28 +1,72 @@
-# HiDe-LLaVA: Hierarchical Decoupling for Continual Instruction Tuning of Multimodal Large Language Model (ACL 2025 Main)
+# Hybrid-LLaVA: Task Prompt Enhanced Continual Instruction Tuning for MLLM
 
-[![🤗 Dataset (HuggingFace)](https://img.shields.io/badge/Dataset-HuggingFace-FFD21E.svg?logo=huggingface&logoColor=yellow)](https://huggingface.co/datasets/HaiyangGuo/UCIT)  [![📑 Paper (arXiv:2503.12941)](https://img.shields.io/badge/arXiv-2503.12941-b31b1b.svg?logo=arXiv)](https://arxiv.org/abs/2503.12941)
+Based on [HiDe-LLaVA](https://github.com/Ghy0501/HiDe-LLaVA) (ACL 2025), this repo explores adding **learnable task prompts** to the hierarchical decoupling framework for continual instruction tuning of Multimodal Large Language Models.
 
-This repo is the official implementation of ACL 2025 paper: **[HiDe-LLaVA: Hierarchical Decoupling for Continual Instruction Tuning of Multimodal Large Language Model](https://arxiv.org/abs/2503.12941)**
+## Method
 
-> HiDe-LLaVA: Hierarchical Decoupling for Continual Instruction Tuning of Multimodal Large Language Model
->
-> Haiyang Guo*, Fanhu Zeng*, Ziwei Xiang, Fei Zhu, Da-Han Wang, Xu-Yao Zhang, Cheng-Lin Liu
+HiDe-LLaVA decouples the model into:
+- **Top layer (Layer 32)**: Task-specific LoRA expansion via MoE with anchor-based routing
+- **Remain layers (Layer 1-31)**: Task-general LoRA fusion
 
-![framework](figure/framework.png)
+**Our modification**: We add a learnable task prompt (`prefix_len=10, hidden_size=4096`) for each task, injected into the input sequence after the system token. During training, prompts are updated via a manual AdamW callback (compatible with DeepSpeed ZeRO-2). An orthogonal loss encourages diversity across task prompts.
 
-## News
+### Architecture
 
-- **2025.12**: We have released [MCITlib](https://arxiv.org/pdf/2508.07307), the first complete open-source codebase providing benchmarks and methods for Multimodal Continual Instruction Tuning. The code is open sourced [here](https://github.com/Ghy0501/MCITlib).
-- **2025.07**: Check out our new work: "[Federated Continual Instruction Tuning](https://arxiv.org/pdf/2503.12897)" (ICCV 2025). The code is open sourced [here](https://github.com/Ghy0501/FCIT).
-- **2025.06**: Check out our new survey: "[A Comprehensive Survey on Continual Learning in Generative Models](https://arxiv.org/pdf/2506.13045)". We provide a systematic review of continual learning across mainstream generative models—including LLMs, MLLMs, Vision-Language Action Models, and Diffusion Models. Feel free to cite or open pull requests!
+```
+Input: [system_token] [task_prompt] [image_tokens] [text_tokens]
+                          ↑
+                   Learnable per-task
+                   prefix embedding
 
-## Abstract
+LLM Layers 1-31:  Fused LoRA (all learned tasks merged)
+LLM Layer 32:     MoE LoRA (weighted expert selection via image/text anchor similarity)
+```
 
-Instruction tuning is widely used to enhance a pre-trained Multimodal Large Language Model (MLLM) to understand and follow human instructions by training it on a curated set of task-specific dataset. However, it is infeasible to collect all possible instruction datasets simultaneously in real-world scenarios. Thus, enabling MLLM with continual instruction tuning is essential for maintaining their adaptability. However, existing methods often trade off memory efficiency for performance gains, significantly compromising overall efficiency. In this paper, we propose a task-specific expansion and task-general fusion framework based on the variations in Centered Kernel Alignment (CKA) similarity across different model layers when trained on diverse datasets. Furthermore, we analyze the information leakage present in the existing benchmark and propose a new and more challenging benchmark to rationally evaluate the performance of different methods. Comprehensive experiments showcase a significant performance improvement of our method compared to existing state-of-the-art methods.
+### Key Files
+
+| File | Description |
+|------|-------------|
+| `llava/model/language_model/llava_hybrid.py` | Hybrid model definition (task_prompts, anchors) |
+| `llava/model/llava_arch.py` | Prompt injection & anchor-based routing logic |
+| `llava/train/train_hybrid.py` | Training pipeline with ManualPromptUpdateCallback |
+| `llava/train/llava_trainer.py` | LlavaHybridTrainer with orthogonal loss |
+| `llava/model/builder.py` | Model loading for training & inference |
+| `llava/eval/model_answer.py` | Evaluation with expert routing |
+| `test_CKA_sim.py` | CKA similarity analysis tool |
+| `HiDe/peft/tuners/clitmoelora.py` | LoRA-MoE implementation |
+
+## Results on UCIT Benchmark
+
+### HiDe-LLaVA (Baseline Reproduction)
+
+| Task | Image-R | ArxivQA | Viz-cap | IconQA | CLEVR | Flickr30k | Avg |
+|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| task1 | 91.87% | | | | | | |
+| task2 | 91.30% | 93.27% | | | | | |
+| task3 | 89.10% | 92.33% | 54.88% | | | | |
+| task4 | 87.23% | 90.83% | 49.07% | 81.67% | | | |
+| task5 | 84.73% | 91.57% | 46.19% | 66.67% | 67.03% | | |
+| task6 | 83.50% | 90.60% | 48.51% | 66.60% | 61.63% | 55.32% | 67.69% |
+
+### Hybrid-LLaVA (Ours)
+
+| Task | Image-R | ArxivQA | Viz-cap | IconQA | CLEVR | Flickr30k | Avg |
+|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| task1 | 91.17% | | | | | | |
+| task2 | 90.73% | 93.23% | | | | | |
+| task3 | 89.03% | 93.07% | 59.77% | | | | |
+| task4 | 87.13% | 90.77% | 50.92% | 84.67% | | | |
+| task5 | 86.13% | 91.87% | 49.21% | 73.00% | 63.20% | | |
+| task6 | 83.97% | 92.43% | 47.12% | 71.63% | 54.13% | 56.40% | 67.61% |
+
+**Key observations**:
+- Improved retention on text-heavy tasks: ArxivQA (+1.83%), IconQA (+5.03%) at task6
+- Degradation on spatial reasoning: CLEVR (-7.50%) at task6
+- Overall Last metric comparable (67.61% vs 67.69%)
 
 ## Installation
 
-The installation of our environment is the same as [CoIN](https://github.com/zackschen/CoIN).
+Same environment as [CoIN](https://github.com/zackschen/CoIN):
 
 ```bash
 conda create -n hide python=3.10 -y
@@ -31,103 +75,29 @@ pip install --upgrade pip
 pip install -e .
 pip install -e ".[train]"
 pip install flash-attn --no-build-isolation
+pip install nltk==3.9.1 pycocotools==2.0.8 pycocoevalcap==1.2
 ```
 
-To measure the metrics of caption tasks, please install the following three packages:
+## Data Preparation
+
+Please refer to the original [HiDe-LLaVA](https://github.com/Ghy0501/HiDe-LLaVA) repo for UCIT benchmark dataset setup, including image downloads and instruction organization.
+
+Pre-trained weights: [LLaVA-v1.5-7b](https://huggingface.co/liuhaotian/llava-v1.5-7b) and [CLIP-ViT-L/14-336](https://huggingface.co/openai/clip-vit-large-patch14-336).
+
+## Training & Evaluation
 
 ```bash
-pip install nltk==3.9.1
-pip install pycocotools==2.0.8
-pip install pycocoevalcap==1.2
-```
-We recommend replacing the eval.py file under that path `/envs/hide/lib/python3.10/site-packages/pycocoevalcap/` in your environment with the eval.py file that we have provided in the repository to avoid unwanted error reporting and time overhead.
+# Train (example: Task 2 with hybrid model)
+bash scripts/HiDe/Train_UCIT/Task2_hybrid.sh
 
-
-Technical issues can be reported and addressed through the official GitHub issue trackers for both projects: [CoIN](https://github.com/zackschen/CoIN) and [LLaVA](https://github.com/haotian-liu/LLaVA).
-
-## UCIT Benchmark
-
-Please download the images from the constituting dataset：
-
-|Image Source | Download Path|
-| :-: | :-: |
-|ArxivQA|[images](https://huggingface.co/datasets/MMInstruction/ArxivQA/tree/main)|
-|ImageNet-R|[images](https://huggingface.co/datasets/HaiyangGuo/UCIT)|
-|IconQA|[images](https://iconqa.github.io/)|
-|CLEVR-Math|[images](https://huggingface.co/datasets/dali-does/clevr-math/tree/main)|
-|VizWiz|[images](https://vizwiz.org/tasks-and-datasets/image-captioning/)|
-|Flickr30k|[images](https://huggingface.co/datasets/HaiyangGuo/UCIT)|
-
-After downloading all of them, organize the data as follows:
-```
-|-- datasets
-    |-- ArxivQA
-        |-- images/
-    |-- CLEVR
-        |-- images
-            |-- train/
-            |-- test/
-            |-- val/
-    |-- Flickr30k
-        |-- train/
-        |-- val/
-    |-- IconQA
-        |-- iconqa_data/
-            |-- iconqa/
-    |-- ImageNet-R
-        |-- train/
-        |-- test/
-    |-- VizWiz
-        |-- train/
-        |-- test/
-        |-- val/
+# Evaluate
+bash scripts/HiDe/Eval_UCIT/Eval_all.sh
 ```
 
-Please download the instructions from our [HuggingFace](https://huggingface.co/datasets/HaiyangGuo/UCIT) page, then, organize the instructions as follows:
-```
-|-- instructions
-    |-- ArxivQA
-        |-- test_3000.json
-        |-- train_4w.json
-    |-- CLEVR
-        |-- test_3000.json
-        |-- train_4w.json
-    |-- Flickr30k
-        |-- test_3000.json
-        |-- train_brief_4w.json
-        |-- val_coco_type_3000.json
-    |-- IconQA
-        |-- test_3000.json
-        |-- train.json
-    |-- ImageNet-R
-        |-- test_3000.json
-        |-- train.json
-    |-- VizWiz
-        |-- test_3000.json
-        |-- train.json
-        |-- val_coco_type_3000.json
-```
+> Modify paths in all `.sh` files to match your environment.
 
-## Pre-trained Weights
+## Acknowledgement
 
-Please download [LLaVA](https://huggingface.co/liuhaotian/llava-v1.5-7b) and [CLIP](https://huggingface.co/openai/clip-vit-large-patch14-336), and use the **config.json** provided in this repository replace the original config.json in LLaVA.
-
-## Training and Evaluation
-
-Once the data and instructions organized and placed correctly, you can train the model by running `./scripts/CoIN/Train_UCIT/train_all.sh`. After the training is completed, you can evaluate the performance by running `./scripts/CoIN/Eval_UCIT/Eval_all.sh`. **Be careful to modify the paths in all `.sh` files to your own actual paths.**
-
-## Citation
-
-```bibtex
-@article{guo2025hide,
-  title={Hide-llava: Hierarchical decoupling for continual instruction tuning of multimodal large language model},
-  author={Guo, Haiyang and Zeng, Fanhu and Xiang, Ziwei and Zhu, Fei and Wang, Da-Han and Zhang, Xu-Yao and Liu, Cheng-Lin},
-  journal={arXiv preprint arXiv:2503.12941},
-  year={2025}
-}
-```
-
-## Acknowledgememnt
-
-This repository is built upon the [LLaVA](https://github.com/haotian-liu/LLaVA) and [CoIN](https://github.com/zackschen/CoIN) projects. We sincerely thank the authors for their valuable contributions to the research community.
-
+- [HiDe-LLaVA](https://github.com/Ghy0501/HiDe-LLaVA) - Guo et al., ACL 2025
+- [LLaVA](https://github.com/haotian-liu/LLaVA) - Liu et al.
+- [CoIN](https://github.com/zackschen/CoIN) - Chen et al.
