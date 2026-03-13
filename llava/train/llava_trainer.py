@@ -1,5 +1,6 @@
 import os
 import torch
+import torch.nn as nn
 
 from torch.utils.data import Sampler
 
@@ -262,3 +263,138 @@ class LLaVATrainer(Trainer):
             pass
         else:
             super(LLaVATrainer, self)._save(output_dir, state_dict)
+
+
+
+class LlavaHybridTrainer(LLaVATrainer):
+
+    def __init__(self, prompt_lr_multiplier=8.0, **kwargs):
+        self.prompt_lr_multiplier = prompt_lr_multiplier
+        super().__init__(**kwargs)
+
+    def create_optimizer(self):
+        """
+        覆盖父类 create_optimizer，将 task_prompts 分离到独立的 param_group，
+        避免手动 add_param_group 被 DeepSpeed 初始化覆盖的问题。
+        """
+        if is_sagemaker_mp_enabled():
+            return super().create_optimizer()
+        if self.sharded_ddp == ShardedDDPOption.SIMPLE:
+            return super().create_optimizer()
+
+        opt_model = self.model
+
+        if self.optimizer is None:
+            decay_parameters = get_parameter_names(opt_model, ALL_LAYERNORM_LAYERS)
+            decay_parameters = [name for name in decay_parameters if "bias" not in name]
+
+            # task_prompts 从 optimizer 中排除，由 ManualPromptUpdateCallback 手动更新。
+            # anchor/boundary 也排除，它们通过 .data 操作更新，不需要 optimizer。
+            exclude_keywords = ['task_prompts', 'image_anchors', 'text_anchors',
+                                'image_boundary', 'text_boundary']
+
+            prompt_params = []  # 保留变量以兼容下面的 mm_projector_lr 分支
+            anchor_params = []
+            decay_params = []
+            no_decay_params = []
+
+            for n, p in opt_model.named_parameters():
+                if not p.requires_grad:
+                    continue
+                if any(kw in n for kw in exclude_keywords):
+                    continue  # 不加入任何 optimizer group
+                elif n in decay_parameters:
+                    decay_params.append(p)
+                else:
+                    no_decay_params.append(p)
+
+            base_lr = self.args.learning_rate
+
+            optimizer_grouped_parameters = [
+                {
+                    "params": decay_params,
+                    "weight_decay": self.args.weight_decay,
+                },
+                {
+                    "params": no_decay_params,
+                    "weight_decay": 0.0,
+                },
+            ]
+
+            # task_prompts 和 anchor/boundary 已从 optimizer 中排除。
+            # task_prompts 由 ManualPromptUpdateCallback 手动 Adam 更新。
+            # anchor/boundary 由 prepare_inputs_labels_for_multimodal 中的 .data 操作更新。
+
+            # 如果有 mm_projector_lr，为 projector 单独设置
+            if self.args.mm_projector_lr is not None:
+                projector_decay = []
+                projector_no_decay = []
+                remaining_decay = []
+                remaining_no_decay = []
+                for n, p in opt_model.named_parameters():
+                    if not p.requires_grad:
+                        continue
+                    if any(kw in n for kw in exclude_keywords):
+                        continue
+                    if "mm_projector" in n:
+                        if n in decay_parameters:
+                            projector_decay.append(p)
+                        else:
+                            projector_no_decay.append(p)
+                    else:
+                        if n in decay_parameters:
+                            remaining_decay.append(p)
+                        else:
+                            remaining_no_decay.append(p)
+
+                optimizer_grouped_parameters = [
+                    {"params": remaining_decay, "weight_decay": self.args.weight_decay},
+                    {"params": remaining_no_decay, "weight_decay": 0.0},
+                    {"params": projector_decay, "weight_decay": self.args.weight_decay, "lr": self.args.mm_projector_lr},
+                    {"params": projector_no_decay, "weight_decay": 0.0, "lr": self.args.mm_projector_lr},
+                ]
+                # task_prompts 和 anchor/boundary 已排除，不加入 optimizer。
+
+            optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args)
+            self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
+
+            # 诊断：打印各 param_group 的参数数量和学习率
+            for i, group in enumerate(self.optimizer.param_groups):
+                num_params = len(group['params'])
+                lr = group.get('lr', self.args.learning_rate)
+                wd = group.get('weight_decay', 0)
+                total_numel = sum(p.numel() for p in group['params'])
+                print(f"[HybridTrainer] param_group {i}: {num_params} params, "
+                      f"{total_numel/1e6:.2f}M elements, lr={lr:.2e}, wd={wd}")
+
+        return self.optimizer
+
+    def compute_loss(self, model, inputs, return_outputs=False):
+        """
+        扩展标准 Loss，加入适配 Gradient Masking 的单向正交约束
+        """
+        outputs = model(**inputs)
+        base_loss = outputs.loss if isinstance(outputs, dict) else outputs[0]
+
+        if self.args.past_index >= 0:
+            self._past = outputs[self.args.past_index]
+
+        cur_model = model.module if hasattr(model, 'module') else model
+
+        total_loss = base_loss
+        if hasattr(cur_model, 'task_keys') and getattr(cur_model, 'cur_task', 0) > 0:
+            task_keys = cur_model.task_keys
+            cur_task_idx = getattr(cur_model, 'cur_task', 0)
+
+            cur_key = task_keys[cur_task_idx:cur_task_idx+1]
+            old_keys = task_keys[:cur_task_idx].detach()
+
+            cur_key_norm = torch.nn.functional.normalize(cur_key, p=2, dim=-1)
+            old_keys_norm = torch.nn.functional.normalize(old_keys, p=2, dim=-1)
+
+            similarity = torch.mm(cur_key_norm, old_keys_norm.t())
+            loss_ortho = (similarity ** 2).mean()
+
+            total_loss = base_loss + 0.1 * loss_ortho
+
+        return (total_loss, outputs) if return_outputs else total_loss

@@ -12,13 +12,13 @@ deepspeed --include localhost:4,5,6 --master_port 29601 llava/train/run.py \
     --expert_num 6 \
     --num_tasks 6 \
     --model_name_or_path "${BASE_DIR}"/models/llava-v1.5-7b \
-    --previous_task_model_path "${BASE_DIR}"/output/ucit/Task4_llava_lora_ours \
+    --previous_task_model_path "${BASE_DIR}"/output/ucit/Task1_llava_lora_ours \
     --version $PROMPT_VERSION \
-    --data_path "${BASE_DIR}"/instructions/CLEVR-Math/train_4w.json \
+    --data_path "${BASE_DIR}"/instructions/ArxivQA/train_4w.json \
     --image_folder "${DATA_DIR}" \
     --vision_tower "${BASE_DIR}"/models/clip-vit-large-patch14-336 \
     --text_tower "${BASE_DIR}"/models/clip-vit-large-patch14-336 \
-    --cur_task 4 \
+    --cur_task 1 \
     --mm_projector_type mlp2x_gelu \
     --mm_vision_select_layer -2 \
     --mm_use_im_start_end False \
@@ -26,7 +26,7 @@ deepspeed --include localhost:4,5,6 --master_port 29601 llava/train/run.py \
     --image_aspect_ratio pad \
     --group_by_modality_length True \
     --bf16 False \
-    --output_dir "${BASE_DIR}"/output/ucit/Task5_llava_lora_ours \
+    --output_dir "${BASE_DIR}"/output/ucit/Task2_llava_lora_ours \
     --num_train_epochs 1 \
     --per_device_train_batch_size 1 \
     --per_device_eval_batch_size 2 \

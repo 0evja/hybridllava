@@ -23,22 +23,154 @@ import pathlib, random
 from typing import Dict, Optional, Sequence, List
 
 import torch
-import sys
 import transformers
+import subprocess
 
 from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
-from peft.utils import WEIGHTS_NAME, set_peft_model_state_dict
 from torch.utils.data import Dataset
-from llava.train.llava_trainer import LLaVATrainer
-from llava.train.llava_trainer import LlavaHybridTrainer
-from llava.model.language_model.llava_hybrid import LlavaHybridConfig, LlavaHybridForCausalLM
+from llava.train.llava_trainer import LLaVATrainer, LlavaHybridTrainer
 
 from llava import conversation as conversation_lib
 from llava.model import *
 from llava.mm_utils import tokenizer_image_token
 
+from HiDe.peft import PeftModel, TaskType, get_peft_model, HiDeMOELoraConfig, WEIGHTS_NAME, set_peft_model_state_dict
+
 from PIL import Image, ImageFile
 ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+from transformers import TrainerCallback
+import torch
+
+
+class ManualPromptUpdateCallback(TrainerCallback):
+    """
+    手动更新 task_prompts，绕过 DeepSpeed optimizer。
+
+    DeepSpeed ZeRO-2 使用内部梯度缓冲区进行 all-reduce 和 optimizer step，
+    PyTorch 的 tensor.register_hook 修改的 param.grad 不会被 DeepSpeed 使用。
+    因此 task_prompts 必须从 DeepSpeed optimizer 中移除，在这里手动更新。
+
+    使用 AdamW 算法，只更新 task_prompts[cur_task] 那一行。
+    """
+    def __init__(self, cur_task=0, lr=6.4e-3, betas=(0.9, 0.999), eps=1e-8,
+                 weight_decay=0.0, print_every=5, grad_accum_steps=1):
+        super().__init__()
+        self.cur_task = cur_task
+        self.lr = lr
+        self.betas = betas
+        self.eps = eps
+        self.weight_decay = weight_decay
+        self.print_every = print_every
+        self.grad_accum_steps = grad_accum_steps
+
+        # Adam state
+        self.m = None  # first moment
+        self.v = None  # second moment
+        self.t = 0     # timestep
+
+        # 监控
+        self.initial_weight = None
+        self.last_mean = None
+        self.last_std = None
+
+        # 保存非当前任务的 prompt 行（用于防止意外修改）
+        self.saved_other_rows = {}
+
+    def _get_task_prompts(self, model):
+        raw = model.module if hasattr(model, 'module') else model
+        if hasattr(raw, 'task_prompts'):
+            return raw.task_prompts
+        return None
+
+    def on_train_begin(self, args, state, control, model=None, **kwargs):
+        p = self._get_task_prompts(model)
+        if p is None:
+            return
+        # 保存非当前任务行的初始值
+        with torch.no_grad():
+            for i in range(p.shape[0]):
+                if i != self.cur_task:
+                    self.saved_other_rows[i] = p.data[i].clone()
+        # 初始化 Adam state（只对当前任务行）
+        row_shape = p.data[self.cur_task].shape
+        self.m = torch.zeros(row_shape, dtype=torch.float32, device=p.device)
+        self.v = torch.zeros(row_shape, dtype=torch.float32, device=p.device)
+        self.initial_weight = p.data[self.cur_task].detach().clone()
+
+        if getattr(args, "local_rank", 0) <= 0:
+            print(f"[ManualPromptUpdate] Initialized for cur_task={self.cur_task}")
+            print(f"  lr={self.lr:.2e}, shape={row_shape}, device={p.device}")
+            print(f"  Other task rows saved: {list(self.saved_other_rows.keys())}")
+
+    def on_before_optimizer_step(self, args, state, control, model=None, **kwargs):
+        """
+        在 optimizer.step() 之前调用（梯度已累积完毕）。
+        此时 task_prompts.grad 包含完整的累积梯度。
+        """
+        p = self._get_task_prompts(model)
+        if p is None or p.grad is None:
+            return
+
+        # --- 0. 多 GPU 梯度同步 ---
+        # task_prompts 不在 DeepSpeed optimizer 中，不会被自动 all-reduce。
+        # 手动对梯度做 all-reduce 以保持多卡一致性。
+        world_size = args.world_size if hasattr(args, 'world_size') else 1
+        if world_size > 1:
+            torch.distributed.all_reduce(p.grad, op=torch.distributed.ReduceOp.AVG)
+
+        # --- 1. 手动 Adam 更新当前任务行 ---
+        # 梯度需要除以 gradient_accumulation_steps，因为 PyTorch 的 backward
+        # 会累加梯度，但 task_prompts 不在 DeepSpeed 的管理中，不会被自动平均。
+        grad = p.grad[self.cur_task].float()
+        if self.grad_accum_steps > 1:
+            grad = grad / self.grad_accum_steps
+
+        self.t += 1
+        self.m = self.betas[0] * self.m + (1 - self.betas[0]) * grad
+        self.v = self.betas[1] * self.v + (1 - self.betas[1]) * (grad ** 2)
+
+        m_hat = self.m / (1 - self.betas[0] ** self.t)
+        v_hat = self.v / (1 - self.betas[1] ** self.t)
+
+        update = self.lr * (m_hat / (v_hat.sqrt() + self.eps))
+
+        with torch.no_grad():
+            p.data[self.cur_task] -= update.to(p.dtype)
+
+        # 清零 task_prompts 的全部梯度
+        p.grad.zero_()
+
+        # --- 2. 恢复非当前任务行 ---
+        with torch.no_grad():
+            for i, saved in self.saved_other_rows.items():
+                p.data[i] = saved
+
+        # --- 3. 监控打印 ---
+        if state.global_step % self.print_every != 0:
+            return
+        if getattr(args, "local_rank", 0) != 0:
+            return
+
+        weight_slice = p[self.cur_task].detach()
+        mean_val = weight_slice.mean().item()
+        std_val = weight_slice.std().item()
+        diff_val = (weight_slice - self.initial_weight).abs().mean().item()
+
+        last_mean_str = f"{self.last_mean:.6f}" if self.last_mean is not None else "N/A"
+
+        print(f"\n>>>> [Step {state.global_step:4d}] task_prompts[{self.cur_task}] 实时监控 <<<<")
+        print(f"   权重均值 (Mean)          : {mean_val:.6f}  (上一步: {last_mean_str})")
+        print(f"   权重标准差 (Std)         : {std_val:.6f}")
+        print(f"   权重累积变化 (Diff)      : {diff_val:.2e} " + ("正在更新" if diff_val > 1e-6 else "⚠️ 未变化!"))
+        print(f"   Adam step               : {self.t}")
+        print(f"   手动 Adam lr             : {self.lr:.2e}")
+        print(f"   world_size              : {world_size}")
+        print("-" * 60)
+
+        self.last_mean = mean_val
+        self.last_std = std_val
+
 
 local_rank = None
 
@@ -56,18 +188,23 @@ class ModelArguments:
     freeze_backbone: bool = field(default=False)
     tune_mm_mlp_adapter: bool = field(default=False)
     vision_tower: Optional[str] = field(default=None)
+    text_tower: Optional[str] = field(default=None)
     mm_vision_select_layer: Optional[int] = field(default=-1)   # default to the last layer
+    mm_text_select_layer: Optional[int] = field(default=-1)   # default to the last layer
+    cur_task: Optional[int] = field(default=0)
     pretrain_mm_mlp_adapter: Optional[str] = field(default=None)
     mm_projector_type: Optional[str] = field(default='linear')
     mm_use_im_start_end: bool = field(default=False)
     mm_use_im_patch_token: bool = field(default=True)
     mm_vision_select_feature: Optional[str] = field(default="patch")
 
-    # --- Hybrid Model 专用参数 ---
-    num_tasks: int = field(default=10, metadata={"help": "Total number of tasks for the prompt pool."})
-    prefix_len: int = field(default=10, metadata={"help": "Length of each expert prompt."})
-    router_dim: int = field(default=768, metadata={"help": "Dimensionality of the router projection."})
-    total_tasks: int = field(default=1, metadata={"help": "Number of tasks to train in this session."})
+    task_embedding_dim: Optional[int] = field(default=64)
+    expert_num: Optional[int] = field(default=6)
+
+    # --- 注入 Hybrid 模型规格参数 ---
+    num_tasks: int = field(default=6, metadata={"help": "专家池总容量"})
+    prefix_len: int = field(default=10, metadata={"help": "每个专家的 Prompt 长度"})
+    router_dim: int = field(default=768, metadata={"help": "路由投影维度"})
 
 
 @dataclass
@@ -159,8 +296,7 @@ def get_peft_state_maybe_zero_3(named_params, bias):
 
 
 def get_peft_state_non_lora_maybe_zero_3(named_params, require_grad_only=True):
-    hybrid_keywords = ['task_prompts', 'task_keys', 'router_query_gen', 'mm_projector']
-    to_return = {k: t for k, t in named_params if any(key in k for key in hybrid_keywords)}
+    to_return = {k: t for k, t in named_params if "lora_" not in k}
     if require_grad_only:
         to_return = {k: t for k, t in to_return.items() if t.requires_grad}
     to_return = {k: maybe_zero_3(v, ignore_status=True).cpu() for k, v in to_return.items()}
@@ -173,20 +309,14 @@ def get_mm_adapter_state_maybe_zero_3(named_params, keys_to_match):
     return to_return
 
 
+
 def find_all_linear_names(model):
     cls = torch.nn.Linear
     lora_module_names = set()
     multimodal_keywords = ['mm_projector', 'vision_tower', 'vision_resampler']
-    hybrid_keywords = ['task_prompts', 'task_keys', 'router_query_gen']
-
     for name, module in model.named_modules():
         if any(mm_keyword in name for mm_keyword in multimodal_keywords):
             continue
-        if any(h_keyword in name for h_keyword in hybrid_keywords):
-            continue
-        if "layers.31" in name:
-            continue
-
         if isinstance(module, cls):
             names = name.split('.')
             lora_module_names.add(names[0] if len(names) == 1 else names[-1])
@@ -653,7 +783,6 @@ class LazySupervisedDataset(Dataset):
         list_data_dict = json.load(open(data_path, "r"))
 
         if data_args.memory_data_path is not None:
-            rank0_print("Adding memory data... {}".format(data_args.memory_data_path))
             list_memory_data_dict = json.load(open(data_args.memory_data_path, "r"))
 
             list_data_dict = list_data_dict + list_memory_data_dict
@@ -790,33 +919,100 @@ def load_model_from_previous_task(model, previous_task_model_path):
     if os.path.exists(os.path.join(previous_task_model_path, 'non_lora_trainables.bin')):
         non_lora_trainables = torch.load(os.path.join(previous_task_model_path, 'non_lora_trainables.bin'), map_location='cpu')
     else:
-        # this is probably from HF Hub
+        # 兼容从 HF Hub 下载的情况
         from huggingface_hub import hf_hub_download
-        def load_from_hf(repo_id, filename, subfolder=None):
-            cache_file = hf_hub_download(
-                repo_id=repo_id,
-                filename=filename,
-                subfolder=subfolder)
-            return torch.load(cache_file, map_location='cpu')
-        non_lora_trainables = load_from_hf(previous_task_model_path, 'non_lora_trainables.bin')
-    non_lora_trainables = {(k[11:] if k.startswith('base_model.') else k): v for k, v in non_lora_trainables.items()}
-    if any(k.startswith('model.model.') for k in non_lora_trainables):
-        non_lora_trainables = {(k[6:] if k.startswith('model.') else k): v for k, v in non_lora_trainables.items()}
-    model.base_model.model.load_state_dict(non_lora_trainables, strict=False)
+        cache_file = hf_hub_download(repo_id=previous_task_model_path, filename='non_lora_trainables.bin', subfolder=None)
+        non_lora_trainables = torch.load(cache_file, map_location='cpu')
 
-    from peft import PeftModel
-    print('Loading LoRA weights...')
-    filename = os.path.join(previous_task_model_path, WEIGHTS_NAME)
-    adapters_weights = torch.load(filename, map_location=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
-    load_result = set_peft_model_state_dict(model, adapters_weights, adapter_name="default")
-    print('Model is loaded...')
+    # --- 关键：Key 映射修正逻辑 ---
+    # 保存时 key 带 'base_model.model.' 前缀（PEFT 包装），
+    # 加载时需要匹配当前 model 的 state_dict 结构。
+    # 策略：先获取当前 model 的所有 key，然后智能匹配。
+    current_keys = set(model.state_dict().keys())
+
+    cleaned_state_dict = {}
+    for k, v in non_lora_trainables.items():
+        # 优先尝试原始 key（直接匹配 PEFT 包装后的路径）
+        if k in current_keys:
+            cleaned_state_dict[k] = v
+            continue
+
+        # 尝试各种前缀清洗
+        matched = False
+        for prefix in ['base_model.model.', 'model.model.', 'base_model.', 'model.']:
+            if k.startswith(prefix):
+                stripped = k[len(prefix):]
+                # 尝试直接匹配
+                if stripped in current_keys:
+                    cleaned_state_dict[stripped] = v
+                    matched = True
+                    break
+                # 尝试加回 PEFT 前缀
+                peft_key = 'base_model.model.' + stripped
+                if peft_key in current_keys:
+                    cleaned_state_dict[peft_key] = v
+                    matched = True
+                    break
+        if not matched:
+            # 最后回退：尝试加 base_model.model. 前缀
+            peft_key = 'base_model.model.' + k
+            if peft_key in current_keys:
+                cleaned_state_dict[peft_key] = v
+            else:
+                cleaned_state_dict[k] = v  # 保留原始 key，strict=False 会忽略不匹配的
+
+    # 加载专家池参数。使用 strict=False 因为底座参数不需要从这里加载
+    load_result = model.load_state_dict(cleaned_state_dict, strict=False)
+    # 检查关键参数是否加载成功
+    missing_hide_keys = [k for k in load_result.missing_keys if any(x in k for x in ['task_prompts', 'anchor', 'boundary'])]
+    if missing_hide_keys:
+        print(f"WARNING: 以下 HiDe 关键参数未加载成功: {missing_hide_keys}")
+    else:
+        print("HiDe 参数 (task_prompts, anchors, boundary) 加载成功。")
+    print(f"非 LoRA 参数加载结果: missing={len(load_result.missing_keys)}, unexpected={len(load_result.unexpected_keys)}")
+
+    # 2. 加载 LoRA 权重 (共享的通用知识)
+    print('正在加载 LoRA 权重...')
+    # 注意：HiDe-LLaVA 源码中使用的 WEIGHTS_NAME 通常是 'adapter_model.bin'
+    lora_bin_path = os.path.join(previous_task_model_path, WEIGHTS_NAME)
+    
+    if os.path.exists(lora_bin_path):
+        adapters_weights = torch.load(lora_bin_path, map_location='cpu')
+        # 使用 PEFT 官方工具将权重注入当前的 LoRA 层
+        set_peft_model_state_dict(model, adapters_weights, adapter_name="default")
+    else:
+        print("警告：未发现 LoRA 权重文件，将仅使用初始化权重。")
+
+    print('模型接力加载完成。')
+   
+    
 
 def train():
     global local_rank
 
     parser = transformers.HfArgumentParser(
         (ModelArguments, DataArguments, TrainingArguments))
+    
+    import torch.utils.checkpoint
+    from functools import partial
+
+    # 核心补丁：强制全局 checkpoint 行为
+    # 将原来的 checkpoint 函数拦截，注入 use_reentrant=False
+    if hasattr(torch.utils.checkpoint, 'checkpoint'):
+        print("DEBUG: Patching torch.utils.checkpoint...")
+        original_checkpoint = torch.utils.checkpoint.checkpoint
+        
+        def patched_checkpoint(function, *args, **kwargs):
+            # 强制覆盖 use_reentrant 参数
+            kwargs['use_reentrant'] = False
+            return original_checkpoint(function, *args, **kwargs)
+        
+        torch.utils.checkpoint.checkpoint = patched_checkpoint
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+
+    training_args.gradient_checkpointing = True
+    training_args.gradient_checkpointing_kwargs = {"use_reentrant": False}
+
     local_rank = training_args.local_rank
     compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
     
@@ -840,21 +1036,23 @@ def train():
         ))
 
     if model_args.vision_tower is not None:
-        # 显示加载并修改配置
-        config = transformers.AutoConfig.from_pretrained(
-            model_args.modal_name_or_path,
-            cache_dir = training_args.cache_dir
+        from llava.model.language_model.llava_hybrid import LlavaHybridForCausalLM, LlavaHybridConfig
+        
+        # 1. 显式加载 Config 并注入 Hybrid 参数
+        config = LlavaHybridConfig.from_pretrained(
+            model_args.model_name_or_path,
+            cache_dir=training_args.cache_dir
         )
         config.num_tasks = model_args.num_tasks
-        config.prefix_len = model_args.prefix_len 
+        config.prefix_len = model_args.prefix_len
         config.router_dim = model_args.router_dim
 
+        # 2. 实例化混合专家模型
         model = LlavaHybridForCausalLM.from_pretrained(
             model_args.model_name_or_path,
-            cache_dir = training_args.cache_dir,
-            config = config,
-            **bnb_model_from_pretrained_args,
-
+            cache_dir=training_args.cache_dir,
+            config=config,
+            **bnb_model_from_pretrained_args
         )
     else:
         model = transformers.LlamaForCausalLM.from_pretrained(
@@ -882,20 +1080,22 @@ def train():
             model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
 
     if training_args.lora_enable:
-        from peft import LoraConfig, get_peft_model
-
-        lora_targets = find_all_linear_names(model)
-
-        lora_config = LoraConfig(
+        kwargs = { 
+                "task_embedding_dim": model_args.task_embedding_dim,
+                "expert_num": model_args.expert_num,
+                "cur_task": model_args.cur_task,
+            }
+        if model_args.expert_num is None:
+            print("WARNING: expert_num is None! Manually setting to 6.")
+            model_args.expert_num = 6  # 或者根据你的 Task1.sh 设为 6
+        lora_config = HiDeMOELoraConfig(
             r=training_args.lora_r,
             lora_alpha=training_args.lora_alpha,
-            target_modules=lora_targets,
+            target_modules=find_all_linear_names(model),
             lora_dropout=training_args.lora_dropout,
             bias=training_args.lora_bias,
-            task_type="CAUSAL_LM",
-
-            layers_to_transform=list(range(31)),
-            modules_to_save=["task_prompts", "task_keys", "router_query_gen"]
+            task_type=TaskType.CAUSAL_LM_HiDe,
+            **kwargs
         )
         if training_args.bits == 16:
             if training_args.bf16:
@@ -946,6 +1146,13 @@ def train():
         vision_tower = model.get_vision_tower()
         vision_tower.to(dtype=torch.bfloat16 if training_args.bf16 else torch.float16, device=training_args.device)
 
+        model.get_model().initialize_text_modules(
+                model_args=model_args,
+                fsdp=training_args.fsdp
+            )
+        text_tower = model.get_text_tower()
+        text_tower.to(dtype=torch.bfloat16 if training_args.bf16 else torch.float16, device=training_args.device)
+
         data_args.image_processor = vision_tower.image_processor
         data_args.is_multimodal = True
 
@@ -986,36 +1193,73 @@ def train():
                     if training_args.bf16 and module.weight.dtype == torch.float32:
                         module = module.to(torch.bfloat16)
 
+    clip_tokenizer = transformers.AutoTokenizer.from_pretrained(
+            model_args.text_tower,
+            cache_dir=training_args.cache_dir,
+            model_max_length=training_args.model_max_length,
+            padding_side="right",
+            use_fast=True,
+        )
+
+    model.set_clip_tokenizer(clip_tokenizer)
+    model.set_tokenizer(tokenizer)
+    model.set_cur_task(model_args.cur_task, model_args.expert_num)
+
+        # --- 调试打印 1 开始 ---
+    raw_model = model.module if hasattr(model, 'module') else model
+    if hasattr(raw_model, 'task_prompts'):
+        print(f"--- [DEBUG 1: After set_cur_task] ---")
+        print(f"Param type: {type(raw_model.task_prompts)}")
+        print(f"Requires Grad: {raw_model.task_prompts.requires_grad}")
+        print(f"Param Shape: {raw_model.task_prompts.shape}")
+        print(f"Device: {raw_model.task_prompts.device}")
+    # --- 调试打印 1 结束 ---
+
+
     if model_args.previous_task_model_path is not None:
         # load model from previous task
         load_model_from_previous_task(model, model_args.previous_task_model_path)
+        model.set_cur_task(model_args.cur_task, model_args.expert_num)
 
     data_module = make_supervised_data_module(tokenizer=tokenizer,
                                               data_args=data_args)
-    trainer = LLaVATrainer(model=model,
+
+    # --- 确保 task_prompts 和 anchors 在 GPU 上且可训练 ---
+    raw_model = model.module if hasattr(model, 'module') else model
+
+    if raw_model.task_prompts.device.type == 'cpu':
+        raw_model.task_prompts.data = raw_model.task_prompts.data.to(training_args.device)
+    raw_model.task_prompts.requires_grad_(True)
+
+    for param_list in [raw_model.image_anchors, raw_model.text_anchors,
+                       raw_model.image_boundary, raw_model.text_boundary]:
+        for param in param_list:
+            if param.device.type == 'cpu':
+                param.data = param.data.to(training_args.device)
+            param.requires_grad_(True)
+
+    print(f"task_prompts: device={raw_model.task_prompts.device}, "
+          f"requires_grad={raw_model.task_prompts.requires_grad}, "
+          f"shape={raw_model.task_prompts.shape}")
+
+    # --- 手动 Adam 更新 task_prompts（绕过 DeepSpeed optimizer） ---
+    # DeepSpeed ZeRO-2 的 optimizer 无法正确更新 task_prompts，
+    # 因此 task_prompts 从 optimizer 中排除，由 ManualPromptUpdateCallback 手动更新。
+    prompt_lr = training_args.learning_rate * 32.0  # prompt_lr_multiplier
+    prompt_callback = ManualPromptUpdateCallback(
+        cur_task=model_args.cur_task,
+        lr=prompt_lr,
+        print_every=5,
+        grad_accum_steps=training_args.gradient_accumulation_steps,
+    )
+
+    trainer = LlavaHybridTrainer(
+                    prompt_lr_multiplier=32.0,
+                    model=model,
                     tokenizer=tokenizer,
                     args=training_args,
+                    callbacks=[prompt_callback],
                     **data_module)
-
-    # if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
-    #     trainer.train(resume_from_checkpoint=True)
-    # else:
-    model.set_cur_task(current_task_id)
-    # 显式冻结非当前任务的 Prompt 行
-    if hasattr(model, 'module'):
-        task_prompts = model.module.task_prompts
-    else:
-        task_prompts = model.task_prompts
-
-    # 只有当前 task_id 对应的行可以更新
-    def set_ice_mask_hook(grad):
-        mask = torch.zeros_like(grad)
-        mask[model.cur_task_id - 1] = 1.0 # 只保留当前任务行的梯度
-        return grad * mask
-
-    if task_prompts.requires_grad:
-        task_prompts.register_hook(set_ice_mask_hook)
-
 
     trainer.train()
     trainer.save_state()
@@ -1030,14 +1274,26 @@ def train():
         non_lora_state_dict = get_peft_state_non_lora_maybe_zero_3(
             model.named_parameters()
         )
+
+        # 验证 task_prompts 是否在保存的权重中
+        has_prompts = any('task_prompts' in k for k in non_lora_state_dict.keys())
+        if has_prompts:
+            print("task_prompts 已包含在 non_lora 权重中")
+        else:
+            print("WARNING: task_prompts 未在 non_lora 权重中，请检查 requires_grad 状态")
+
         if training_args.local_rank == 0 or training_args.local_rank == -1:
             model.config.save_pretrained(training_args.output_dir)
             model.save_pretrained(training_args.output_dir, state_dict=state_dict)
             torch.save(non_lora_state_dict, os.path.join(training_args.output_dir, 'non_lora_trainables.bin'))
+        print('image_boundary: {}'.format(torch.cat([param for param in model.image_boundary], dim=0).float().detach().cpu().numpy()))
+        print('text_boundary: {}'.format(torch.cat([param for param in model.text_boundary], dim=0).float().detach().cpu().numpy()))
     else:
         safe_save_model_for_hf_trainer(trainer=trainer,
                                        output_dir=training_args.output_dir)
 
+    remove_dir = training_args.output_dir
+    subprocess.run(f"find {remove_dir} -maxdepth 1 -type d -name 'checkpoint-*' -exec rm -rf {{}} +", shell=True)
 
 if __name__ == "__main__":
     train()

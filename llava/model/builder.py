@@ -1,28 +1,14 @@
-#    Copyright 2023 Haotian Liu
-#
-#    Licensed under the Apache License, Version 2.0 (the "License");
-#    you may not use this file except in compliance with the License.
-#    You may obtain a copy of the License at
-#
-#        http://www.apache.org/licenses/LICENSE-2.0
-#
-#    Unless required by applicable law or agreed to in writing, software
-#    distributed under the License is distributed on an "AS IS" BASIS,
-#    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#    See the License for the specific language governing permissions and
-#    limitations under the License.
-
-
-import os, sys
+import os
+import sys
 import warnings
 import shutil
-
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, BitsAndBytesConfig
 import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, BitsAndBytesConfig
+
+# 导入自定义架构
+from llava.model.language_model.llava_hybrid import LlavaHybridForCausalLM, LlavaHybridConfig
 from llava.model import *
 from llava.constants import DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
-
-sys.path.append('/mnt/haiyangguo/mywork/CL-MLLM/LLaVA-HiDe')
 
 def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, load_4bit=False, device_map="auto", device="cuda", text_tower=None, **kwargs):
     kwargs = {"device_map": device_map, **kwargs}
@@ -44,108 +30,107 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
         kwargs['torch_dtype'] = torch.float16
 
     if 'llava' in model_name.lower():
-        # Load LLaVA model
-        if 'lora' in model_name.lower() and model_base is None:
-            warnings.warn('There is `lora` in model name but no `model_base` is provided. If you are loading a LoRA model, please provide the `model_base` argument. Detailed instruction: https://github.com/haotian-liu/LLaVA#launch-a-model-worker-lora-weights-unmerged.')
+        # --- 情况 A: 加载 LoRA 模型 ---
         if 'lora' in model_name.lower() and model_base is not None:
             lora_cfg_pretrained = AutoConfig.from_pretrained(model_path)
             tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
-            print('Loading LLaVA from base model...')
-            model = LlavaLlamaForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=lora_cfg_pretrained, **kwargs)
+            print(f'Loading LLaVA from base model: {model_base}...')
 
-            clip_tokenizer = AutoTokenizer.from_pretrained(
-                text_tower,
-                cache_dir=None,
-                model_max_length=77,
-                padding_side="right",
-                use_fast=True,
-            )
+            # LoRA 场景：先加载到 CPU，等所有权重（non-lora + LoRA）加载完再移到 CUDA
+            lora_kwargs = {k: v for k, v in kwargs.items() if k != 'device_map'}
+            lora_kwargs['torch_dtype'] = torch.float16
 
-            model.set_clip_tokenizer(clip_tokenizer)
-            model.set_tokenizer(tokenizer)
-            token_num, tokem_dim = model.lm_head.out_features, model.lm_head.in_features
-            if model.lm_head.weight.shape[0] != token_num:
-                model.lm_head.weight = torch.nn.Parameter(torch.empty(token_num, tokem_dim, device=model.device, dtype=model.dtype))
-                model.model.embed_tokens.weight = torch.nn.Parameter(torch.empty(token_num, tokem_dim, device=model.device, dtype=model.dtype))
-
-            print('Loading additional LLaVA weights...')
-            if os.path.exists(os.path.join(model_path, 'non_lora_trainables.bin')):
-                non_lora_trainables = torch.load(os.path.join(model_path, 'non_lora_trainables.bin'), map_location='cpu')
+            if getattr(lora_cfg_pretrained, "model_type", None) == "llava_hybrid":
+                print("Detected LlavaHybrid architecture, initializing...")
+                model = LlavaHybridForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=lora_cfg_pretrained, **lora_kwargs)
             else:
-                # this is probably from HF Hub
-                from huggingface_hub import hf_hub_download
-                def load_from_hf(repo_id, filename, subfolder=None):
-                    cache_file = hf_hub_download(
-                        repo_id=repo_id,
-                        filename=filename,
-                        subfolder=subfolder)
-                    return torch.load(cache_file, map_location='cpu')
-                non_lora_trainables = load_from_hf(model_path, 'non_lora_trainables.bin')
-            non_lora_trainables = {(k[11:] if k.startswith('base_model.') else k): v for k, v in non_lora_trainables.items()}
-            if any(k.startswith('model.model.') for k in non_lora_trainables):
-                non_lora_trainables = {(k[6:] if k.startswith('model.') else k): v for k, v in non_lora_trainables.items()}
-            model.load_state_dict(non_lora_trainables, strict=False)
+                model = LlavaLlamaForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=lora_cfg_pretrained, **lora_kwargs)
 
-            from HiDe.peft import PeftModel, TaskType, get_peft_model, HiDeMOELoraConfig, WEIGHTS_NAME, set_peft_model_state_dict
-            # else:
-            #     from peft import PeftModel
-            print('Loading LoRA weights...')
+            if text_tower is not None:
+                print(f"Initializing CLIP tokenizer from: {text_tower}")
+                clip_tokenizer = AutoTokenizer.from_pretrained(
+                    text_tower,
+                    model_max_length=77,
+                    padding_side="right",
+                    use_fast=True,
+                )
+                if hasattr(model, 'set_clip_tokenizer'):
+                    model.set_clip_tokenizer(clip_tokenizer)
+            
+            if hasattr(model, 'set_tokenizer'):
+                model.set_tokenizer(tokenizer)
+
+            # --- 核心修复：加载 non-lora trainables (彻底剥离多余前缀) ---
+            print('Loading additional LLaVA weights (non-lora trainables)...')
+            non_lora_trainables_path = os.path.join(model_path, 'non_lora_trainables.bin')
+            if os.path.exists(non_lora_trainables_path):
+                non_lora_trainables = torch.load(non_lora_trainables_path, map_location='cpu')
+                
+                print('Stripping recursive prefixes (base_model / model)...')
+                cleaned_weights = {}
+                for k, v in non_lora_trainables.items():
+                    new_k = k
+                    # 只剥离第一个匹配的前缀，避免过度剥离
+                    for prefix in ['base_model.model.', 'base_model.', 'model.model.', 'model.']:
+                        if new_k.startswith(prefix):
+                            new_k = new_k[len(prefix):]
+                            break
+                    cleaned_weights[new_k] = v
+                
+                # strict=False 允许加载部分权重，并返回缺失/多余的 Key
+                load_result = model.load_state_dict(cleaned_weights, strict=False, assign=True)
+
+                # 诊断：显示加载了哪些关键权重
+                loaded_keys = [k for k in cleaned_weights.keys() if any(x in k for x in ['task_prompts', 'anchor', 'boundary', 'mm_projector'])]
+                print(f"Loaded non-lora keys (key subset): {loaded_keys[:10]}")
+
+                missing_hide_keys = [k for k in load_result.missing_keys if any(x in k for x in ['task', 'anchor', 'boundary', 'mm_projector'])]
+                if missing_hide_keys:
+                    print(f"⚠️  WARNING: Missing keys during loading: {missing_hide_keys}")
+                else:
+                    print("✅ HiDe + mm_projector keys loaded successfully.")
+
+                unexpected_keys = load_result.unexpected_keys
+                if unexpected_keys:
+                    print(f"⚠️  Unexpected keys (not in model): {unexpected_keys[:10]}")
+
+            # 加载并合并 LoRA 权重
+            from HiDe.peft import PeftModel
+            print('Loading LoRA weights via HiDe.peft...')
             model = PeftModel.from_pretrained(model, model_path)
-            print('Merging LoRA weights...')
-            model = model.merge_and_unload()
-            print('Model is loaded...')
+            # print('Merging LoRA weights...')
+            # model = model.merge_and_unload()
+            print('LoRA loaded in PEFT mode (no merge).')
+            model.to(device=device)
+
+        # --- 情况 B: 仅加载 Projector 模式 ---
         elif model_base is not None:
-            # this may be mm projector only
-            print('Loading LLaVA from base model...')
-            if 'mpt' in model_name.lower():
-                if not os.path.isfile(os.path.join(model_path, 'configuration_mpt.py')):
-                    shutil.copyfile(os.path.join(model_base, 'configuration_mpt.py'), os.path.join(model_path, 'configuration_mpt.py'))
-                tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=True)
-                cfg_pretrained = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-                model = LlavaMPTForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=cfg_pretrained, **kwargs)
+            print('Loading LLaVA from base model (Projector-only mode)...')
+            cfg_pretrained = AutoConfig.from_pretrained(model_path)
+            tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
+            
+            if getattr(cfg_pretrained, "model_type", None) == "llava_hybrid":
+                model = LlavaHybridForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=cfg_pretrained, **kwargs)
             else:
-                tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
-                cfg_pretrained = AutoConfig.from_pretrained(model_path)
                 model = LlavaLlamaForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=cfg_pretrained, **kwargs)
 
             mm_projector_weights = torch.load(os.path.join(model_path, 'mm_projector.bin'), map_location='cpu')
-            mm_projector_weights = {k: v.to(torch.float16) for k, v in mm_projector_weights.items()}
-            model.load_state_dict(mm_projector_weights, strict=False)
+            model.load_state_dict({k: v.to(torch.float16) for k, v in mm_projector_weights.items()}, strict=False)
+        
+        # --- 情况 C: 直接加载完整模型 ---
         else:
-            if 'mpt' in model_name.lower():
-                tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
-                model = LlavaMPTForCausalLM.from_pretrained(model_path, low_cpu_mem_usage=True, **kwargs)
+            print(f'Loading full LLaVA model from {model_path}...')
+            tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
+            cfg_pretrained = AutoConfig.from_pretrained(model_path)
+            if getattr(cfg_pretrained, "model_type", None) == "llava_hybrid":
+                model = LlavaHybridForCausalLM.from_pretrained(model_path, low_cpu_mem_usage=True, **kwargs)
             else:
-                tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
                 model = LlavaLlamaForCausalLM.from_pretrained(model_path, low_cpu_mem_usage=True, **kwargs)
-    else:
-        # Load language model
-        if model_base is not None:
-            # PEFT model
-            from peft import PeftModel
-            tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
-            model = AutoModelForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, **kwargs)
-            print(f"Loading LoRA weights from {model_path}")
-            model = PeftModel.from_pretrained(model, model_path)
-            print(f"Merging weights")
-            model = model.merge_and_unload()
-            print('Convert to FP16...')
-            model.to(torch.float16)
-        else:
-            use_fast = False
-            if 'mpt' in model_name.lower():
-                tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
-                model = AutoModelForCausalLM.from_pretrained(model_path, low_cpu_mem_usage=True, trust_remote_code=True, **kwargs)
-            else:
-                tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
-                model = AutoModelForCausalLM.from_pretrained(model_path, low_cpu_mem_usage=True, **kwargs)
 
-    image_processor = None
-
+    # --- 后处理：Vision & Text Towers ---
     if 'llava' in model_name.lower():
         mm_use_im_start_end = getattr(model.config, "mm_use_im_start_end", False)
-        mm_use_im_patch_token = getattr(model.config, "mm_use_im_patch_token", True)
-        if mm_use_im_patch_token:
+        if getattr(model.config, "mm_use_im_patch_token", True):
             tokenizer.add_tokens([DEFAULT_IMAGE_PATCH_TOKEN], special_tokens=True)
         if mm_use_im_start_end:
             tokenizer.add_tokens([DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN], special_tokens=True)
@@ -157,14 +142,14 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
         vision_tower.to(device=device, dtype=torch.float16)
         image_processor = vision_tower.image_processor
 
-        text_tower = model.get_text_tower()
-        if not text_tower.is_loaded:
-            text_tower.load_model()
-        text_tower.to(device=device, dtype=torch.float16)
+        if hasattr(model, 'get_text_tower'):
+            text_tower_obj = model.get_text_tower()
+            if text_tower_obj is not None:
+                if not text_tower_obj.is_loaded:
+                    text_tower_obj.load_model()
+                text_tower_obj.to(device=device, dtype=torch.float16)
 
-    if hasattr(model.config, "max_sequence_length"):
-        context_len = model.config.max_sequence_length
-    else:
-        context_len = 2048
+    model.eval()
+    context_len = getattr(model.config, "max_sequence_length", 2048)
 
     return tokenizer, model, image_processor, context_len

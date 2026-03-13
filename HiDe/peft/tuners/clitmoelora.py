@@ -351,6 +351,21 @@ class HiDeMOELoraLinear(nn.Linear, HiDeMOELoraLayer):
         self.update_layer(adapter_name, r, lora_alpha, lora_dropout, init_lora_weights)
         self.active_adapter = adapter_name
 
+    def set_cur_task(self, cur_task: int, expert_num: Optional[int] = None):
+        """支持多任务增量学习：动态切换当前任务（Task1~Task6 必需）"""
+        self.cur_task = cur_task
+        if expert_num is not None:
+            self.expert_num = expert_num
+        # 同步到内部 lora_A / lora_B（保险起见）
+        if hasattr(self, 'lora_A') and self.lora_A is not None:
+            for a in self.lora_A.values():
+                if hasattr(a, 'cur_task'):
+                    a.cur_task = cur_task
+        if hasattr(self, 'lora_B') and self.lora_B is not None:
+            for b in self.lora_B.values():
+                if hasattr(b, 'cur_task'):
+                    b.cur_task = cur_task
+
 
     def merge(self):
         if self.active_adapter not in self.lora_A.keys():
@@ -444,7 +459,10 @@ class HiDeMOELinearA(nn.Module):
         self.training = training
         self.layer = layer
         self.expert_weight = weight
-
+        
+        if self.out_features % self.expert_num != 0:
+            print(f"DEBUG ERROR: out_features(r)={self.out_features}, expert_num={self.expert_num}")
+            import pdb; pdb.set_trace()
         assert self.out_features % self.expert_num == 0  # lora rank should be divided by expert number
         self.r = self.out_features // self.expert_num
         

@@ -50,27 +50,6 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
 
         # Initialize weights and apply final processing
         self.post_init()
-        self.training = False
-        self.cur_task = 0
-        self.expert_num = 6
-
-        # Initialize anchors
-        self.image_anchors = nn.ParameterList(
-            [nn.Parameter(0.1 * torch.randn(1, 768)) for _ in range(10)]
-        )
-
-        self.text_anchors = nn.ParameterList(
-            [nn.Parameter(0.1 * torch.randn(1, 768)) for _ in range(10)]
-        )
-
-        self.image_boundary = nn.ParameterList(
-            [nn.Parameter(torch.ones(1, dtype=torch.bfloat16)) for _ in range(10)]
-            )
-        self.text_boundary = nn.ParameterList(
-            [nn.Parameter(torch.ones(1, dtype=torch.bfloat16)) for _ in range(10)]
-            )
-
-        self.expert_weight = [0., 0., 0., 0., 0., 0., 0., 0., 0., 0.]
 
     def set_cur_task(self, cur_task, expert_num):
         self.cur_task = cur_task
@@ -82,27 +61,9 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         for name, param in self.text_anchors.named_parameters():
             param.requires_grad = True
 
-    def set_boundary_for_save(self):
-        for name, param in self.image_boundary.named_parameters():
-            param.requires_grad = True
-        
-        for name, param in self.text_boundary.named_parameters():
-            param.requires_grad = True
-
-        for name, param in self.image_anchors.named_parameters():
-            param.requires_grad = True
-        
-        for name, param in self.text_anchors.named_parameters():
-            param.requires_grad = True
 
     def get_model(self):
         return self.model
-
-    def set_clip_tokenizer(self, tokenizer):
-        self.clip_tokenizer = tokenizer
-
-    def set_tokenizer(self, tokenizer):
-        self.tokenizer = tokenizer
 
     def forward(
         self,

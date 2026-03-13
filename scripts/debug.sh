@@ -1,0 +1,17 @@
+CUDA_VISIBLE_DEVICES=0 python llava/train/run.py \
+    --lora_r 48 \
+    --expert_num 6 \
+    --model_name_or_path /home/hechen/zms/MLLM_Factory/HiDe-LLaVA/models/llava-v1.5-7b \
+    --version v1 \
+    --data_path /home/hechen/zms/MLLM_Factory/HiDe-LLaVA/instructions/ImageNet-R/train.json \
+    --image_folder /data1/zms \
+    --vision_tower /home/hechen/zms/MLLM_Factory/HiDe-LLaVA/models/clip-vit-large-patch14-336 \
+    --text_tower /home/hechen/zms/MLLM_Factory/HiDe-LLaVA/models/clip-vit-large-patch14-336 \
+    --lora_enable True \
+    --bf16 True \
+    --output_dir ./checkpoints/debug \
+    --num_train_epochs 1 \
+    --per_device_train_batch_size 1 \
+    --gradient_accumulation_steps 1 \
+    --evaluation_strategy no \
+    --lazy_preprocess True
