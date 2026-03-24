@@ -1245,7 +1245,7 @@ def train():
     # --- 手动 Adam 更新 task_prompts（绕过 DeepSpeed optimizer） ---
     # DeepSpeed ZeRO-2 的 optimizer 无法正确更新 task_prompts，
     # 因此 task_prompts 从 optimizer 中排除，由 ManualPromptUpdateCallback 手动更新。
-    prompt_lr = training_args.learning_rate * 32.0  # prompt_lr_multiplier
+    prompt_lr = training_args.learning_rate * 2.5  # prompt_lr_multiplier (5e-4 when base_lr=2e-4)
     prompt_callback = ManualPromptUpdateCallback(
         cur_task=model_args.cur_task,
         lr=prompt_lr,
@@ -1254,7 +1254,7 @@ def train():
     )
 
     trainer = LlavaHybridTrainer(
-                    prompt_lr_multiplier=32.0,
+                    prompt_lr_multiplier=2.5,
                     model=model,
                     tokenizer=tokenizer,
                     args=training_args,

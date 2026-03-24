@@ -159,7 +159,7 @@ def get_peft_state_maybe_zero_3(named_params, bias):
 
 
 def get_peft_state_non_lora_maybe_zero_3(named_params, require_grad_only=True):
-    hybrid_keywords = ['task_prompts', 'task_keys', 'router_query_gen', 'mm_projector']
+    hybrid_keywords = ['task_prompts', 'router_query_gen', 'mm_projector']
     to_return = {k: t for k, t in named_params if any(key in k for key in hybrid_keywords)}
     if require_grad_only:
         to_return = {k: t for k, t in to_return.items() if t.requires_grad}
@@ -177,7 +177,7 @@ def find_all_linear_names(model):
     cls = torch.nn.Linear
     lora_module_names = set()
     multimodal_keywords = ['mm_projector', 'vision_tower', 'vision_resampler']
-    hybrid_keywords = ['task_prompts', 'task_keys', 'router_query_gen']
+    hybrid_keywords = ['task_prompts', 'router_query_gen']
 
     for name, module in model.named_modules():
         if any(mm_keyword in name for mm_keyword in multimodal_keywords):
@@ -895,7 +895,7 @@ def train():
             task_type="CAUSAL_LM",
 
             layers_to_transform=list(range(31)),
-            modules_to_save=["task_prompts", "task_keys", "router_query_gen"]
+            modules_to_save=["task_prompts", "router_query_gen"]
         )
         if training_args.bits == 16:
             if training_args.bf16:

@@ -64,6 +64,51 @@ LLM Layer 32:     MoE LoRA (weighted expert selection via image/text anchor simi
 - Degradation on spatial reasoning: CLEVR (-7.50%) at task6
 - Overall Last metric comparable (67.61% vs 67.69%)
 
+## Roadmap
+
+### Current Status (v1.0 — Input-level Task Prompt)
+
+Initial attempt: inject learnable task prompt into input sequence. Results show improvement on semantic tasks (ArxivQA +1.83%, IconQA +5.03%) but degradation on spatial reasoning (CLEVR -7.50%). Overall 67.61% vs baseline 67.69%.
+
+**Identified issues**:
+1. Prompt inserted before image tokens disrupts visual position encoding → CLEVR drop
+2. Input-level prompt overlaps functionally with top-layer MoE routing (both do task discrimination)
+
+### Next Steps
+
+#### 1. Task Prompt Architecture Optimization
+
+- [ ] Move prompt position: `[sys][image][PROMPT][text]` — fix CLEVR degradation
+- [ ] Lower prompt lr from 6.4e-3 to ~5e-4 (same order as LoRA lr 2e-4)
+- [ ] **Core innovation**: Use task embedding to generate per-layer adaptive fusion coefficients for remain layers, replacing fixed ε=1.0. This complements the top-layer MoE (top layer selects experts, remain layers adapt fusion weights)
+
+#### 2. Experience Replay
+
+- [ ] Save 5-10% representative samples per learned task
+- [ ] Mix replay data when training new tasks to provide gradient signal for old knowledge retention
+
+#### 3. Non-stationary Task Sequence Evaluation
+
+- [ ] Current UCIT benchmark: each task appears only once in fixed order — unrealistic
+- [ ] Construct interleaved task sequences where the same task recurs with different data subsets
+- [ ] Example: ImageNet-R(subset1) → ArxivQA(subset1) → IconQA(subset1) → ImageNet-R(subset2) → IconQA(subset2) → ...
+- [ ] Evaluate whether the model can accumulate knowledge (not just resist forgetting) under task recurrence
+
+#### 4. Ablation & Paper
+
+- [ ] Full ablation: prompt position, fusion method, replay ratio
+- [ ] Compare with HiDe-LLaVA, CoIN, O-LoRA baselines
+- [ ] Write thesis
+
+### Timeline
+
+| Period | Goal |
+|--------|------|
+| 03.20 — 04.06 | Architecture optimization & initial experiments |
+| 04.07 — 04.20 | Comparative experiments & ablation study |
+| 04.21 — 04.27 | Thesis first draft |
+| 04.28 — 05.15 | Revision & defense preparation |
+
 ## Installation
 
 Same environment as [CoIN](https://github.com/zackschen/CoIN):

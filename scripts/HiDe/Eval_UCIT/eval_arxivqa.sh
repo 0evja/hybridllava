@@ -14,7 +14,7 @@ MODEL_BASE="${BASE_DIR}/models/llava-v1.5-7b"
 TEXT_TOWER="${BASE_DIR}/models/clip-vit-large-patch14-336"
 QUESTION_FILE="${BASE_DIR}/instructions/ArxivQA/test_3000.json"
 IMAGE_FOLDER="/data1/zms/datasets"
-RESULT_DIR="./results/UCIT/each_dataset/ArxivQA"
+RESULT_DIR="${RESULT_BASE:-./results/UCIT}/each_dataset/ArxivQA"
 
 # --- Derived params ---
 CUR_TASK=$((EXPERT_NUM - 1))

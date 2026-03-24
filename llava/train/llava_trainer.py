@@ -370,31 +370,10 @@ class LlavaHybridTrainer(LLaVATrainer):
         return self.optimizer
 
     def compute_loss(self, model, inputs, return_outputs=False):
-        """
-        扩展标准 Loss，加入适配 Gradient Masking 的单向正交约束
-        """
         outputs = model(**inputs)
-        base_loss = outputs.loss if isinstance(outputs, dict) else outputs[0]
+        loss = outputs.loss if isinstance(outputs, dict) else outputs[0]
 
         if self.args.past_index >= 0:
             self._past = outputs[self.args.past_index]
 
-        cur_model = model.module if hasattr(model, 'module') else model
-
-        total_loss = base_loss
-        if hasattr(cur_model, 'task_keys') and getattr(cur_model, 'cur_task', 0) > 0:
-            task_keys = cur_model.task_keys
-            cur_task_idx = getattr(cur_model, 'cur_task', 0)
-
-            cur_key = task_keys[cur_task_idx:cur_task_idx+1]
-            old_keys = task_keys[:cur_task_idx].detach()
-
-            cur_key_norm = torch.nn.functional.normalize(cur_key, p=2, dim=-1)
-            old_keys_norm = torch.nn.functional.normalize(old_keys, p=2, dim=-1)
-
-            similarity = torch.mm(cur_key_norm, old_keys_norm.t())
-            loss_ortho = (similarity ** 2).mean()
-
-            total_loss = base_loss + 0.1 * loss_ortho
-
-        return (total_loss, outputs) if return_outputs else total_loss
+        return (loss, outputs) if return_outputs else loss

@@ -15,7 +15,7 @@ MODEL_BASE="${BASE_DIR}/models/llava-v1.5-7b"
 TEXT_TOWER="${BASE_DIR}/models/clip-vit-large-patch14-336"
 QUESTION_FILE="${BASE_DIR}/instructions/ImageNet-R/test_3000.json"
 IMAGE_FOLDER="/data1/zms"
-RESULT_DIR="./results/UCIT/each_dataset/ImageNet-R"
+RESULT_DIR="${RESULT_BASE:-./results/UCIT}/each_dataset/ImageNet-R"
 
 # --- Derived params ---
 # CUR_TASK = EXPERT_NUM - 1, so non-last layers fuse all trained experts

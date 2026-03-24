@@ -356,7 +356,10 @@ class LlavaMetaForCausalLM(ABC):
                 #         print("prompt dtype:", target_prompts.dtype)
                 #         print("prompt shape:", target_prompts.shape)
 
-                insert_pos = 1 if len(cur_new_input_embeds) > 0 else 0
+                # 插入到 image token 之后：[sys][image][PROMPT][text]
+                # 单图情况下，循环后 cur_new_input_embeds = [text_before_img, img, text_after_img]
+                # image 在 index 1，所以 prompt 插入 index 2（image 之后）
+                insert_pos = min(2, len(cur_new_input_embeds))
                 cur_new_input_embeds.insert(insert_pos, target_prompts)
                 cur_new_labels.insert(insert_pos, torch.full(
                     (target_prompts.shape[0],), IGNORE_INDEX,

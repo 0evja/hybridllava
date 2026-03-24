@@ -15,7 +15,7 @@ TEXT_TOWER="${BASE_DIR}/models/clip-vit-large-patch14-336"
 QUESTION_FILE="${BASE_DIR}/instructions/VizWiz/test_3000.json"
 ANNOTATION_FILE="${BASE_DIR}/instructions/VizWiz/val_coco_type_3000.json"
 IMAGE_FOLDER="/data1/zms/datasets"
-RESULT_DIR="./results/UCIT/each_dataset/VizWiz"
+RESULT_DIR="${RESULT_BASE:-./results/UCIT}/each_dataset/VizWiz"
 
 # --- Derived params ---
 CUR_TASK=$((EXPERT_NUM - 1))
